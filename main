@@ -1,0 +1,419 @@
+import json
+import hashlib
+import os
+import logging
+import requests
+import re
+import geoip2.database
+from datetime import datetime
+from collections import Counter
+import configparser
+
+# Load the configuration file
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+# Ensure all required keys are present
+required_keys = [
+    ('DEFAULT', 'geoip_db'),
+    ('DEFAULT', 'max_requests_per_minute'),
+    ('DEFAULT', 'expected_country'),
+    ('DEFAULT', 'unusual_status_codes'),
+    ('DEFAULT', 'log_file'),
+    ('API', 'abuseipdb_api_key'),
+    ('WHITELIST', 'ips'),
+    ('LOGGING', 'log_file'),
+    ('LOGGING', 'log_level')
+]
+
+for section, key in required_keys:
+    if not config.has_option(section, key):
+        raise KeyError(f"Missing {key} in section [{section}] of config.ini")
+
+# Extract configurations
+GEOIP_DB = config['DEFAULT']['geoip_db']
+MAX_REQUESTS_PER_MINUTE = int(config['DEFAULT']['max_requests_per_minute'])
+EXPECTED_COUNTRY = config['DEFAULT']['expected_country']
+UNUSUAL_STATUS_CODES = set(map(int, config['DEFAULT']['unusual_status_codes'].split(',')))
+
+# Extract API key and whitelist
+ABUSEIPDB_API_KEY = config['API']['abuseipdb_api_key']
+IP_WHITELIST = set(config['WHITELIST']['ips'].split(','))
+
+# Define the anomaly database file
+ANOMALY_DB_FILE = 'anomaly_db.json'
+LOG_HASH_FILE = 'log_hash.txt'  # To store the last hash of the log file
+
+# Configure logging
+logging.basicConfig(
+    filename=config['LOGGING']['log_file'],
+    level=getattr(logging, config['LOGGING']['log_level'].upper()),
+    format='%(message)s'
+)
+
+# Regular expression for parsing logs
+log_pattern = re.compile(
+    r'(?P<ip>\S+) (?P<domain>\S+) \S+ \[(?P<datetime>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) \S+" (?P<status>\d{3}) (?P<size>\d+) '
+    r'"[^"]*" "(?P<user_agent>[^"]*)" \| (?P<tls>\S+) \| (?P<req_time>\S+) (?P<resp_time>\S+) (?P<cache_hit>\S+) (?P<cache_status>\S+) (?P<other>.+)'
+)
+
+# List of legitimate bot user agents
+legitimate_bots = [
+    "Googlebot",
+    "Bingbot",
+    "Slurp",
+    "DuckDuckBot"
+]
+
+# Statistical variables
+traffic_stats = {
+    'total_requests': 0,
+    'total_bytes': 0,
+    'unique_ips': set(),
+    'user_agent_counts': Counter(),
+    'suspicious_requests': [],
+    'ip_counts': Counter()
+}
+geoip_reader = geoip2.database.Reader(GEOIP_DB)
+
+# Aggiunta di una nuova statistica per registrare i path con status 200
+HTTP_200_PATHS = Counter()
+
+def load_anomaly_db():
+    """Load the anomaly database from a JSON file."""
+    try:
+        with open(ANOMALY_DB_FILE, 'r') as db_file:
+            return json.load(db_file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_anomaly_db(anomaly_db):
+    """Save the updated anomaly database to a JSON file."""
+    with open(ANOMALY_DB_FILE, 'w') as db_file:
+        json.dump(anomaly_db, db_file, indent=4)
+
+def update_anomaly_db(ip, anomaly_reason):
+    """Update the anomaly database with counts and reasons."""
+    anomaly_db = load_anomaly_db()
+
+    if ip not in anomaly_db:
+        anomaly_db[ip] = {
+            'count': 0,
+            'anomalies': {}
+        }
+
+    anomaly_db[ip]['count'] += 1
+    if anomaly_reason in anomaly_db[ip]['anomalies']:
+        anomaly_db[ip]['anomalies'][anomaly_reason] += 1
+    else:
+        anomaly_db[ip]['anomalies'][anomaly_reason] = 1
+
+    save_anomaly_db(anomaly_db)
+
+def compute_file_hash(file_path):
+    """Compute the SHA256 hash of the given file."""
+    hash_sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            hash_sha256.update(byte_block)
+    return hash_sha256.hexdigest()
+
+def load_last_log_hash():
+    """Load the last computed hash of the log file."""
+    try:
+        with open(LOG_HASH_FILE, 'r') as hash_file:
+            return hash_file.read().strip()
+    except FileNotFoundError:
+        return None
+
+def save_current_log_hash(current_hash):
+    """Save the current hash of the log file."""
+    with open(LOG_HASH_FILE, 'w') as hash_file:
+        hash_file.write(current_hash)
+
+def is_suspicious_path(path):
+    """Check if the given path is suspicious (implement your own logic)."""
+    suspicious_paths = ['/admin', '/login', '/test']
+    return any(suspicious in path for suspicious in suspicious_paths)
+
+def check_abuse_ip(ip):
+    """Check the given IP against the AbuseIPDB API."""
+    url = 'https://api.abuseipdb.com/api/v2/check'
+    querystring = {
+        'ipAddress': ip,
+        'maxAgeInDays': '90'
+    }
+
+    headers = {
+        'Accept': 'application/json',
+        'Key': ABUSEIPDB_API_KEY
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=querystring, timeout=5)
+        response.raise_for_status()  # Raise an error for bad responses (4xx, 5xx)
+
+        decoded_response = response.json()  # Decode the JSON response
+        # Check if the IP has been reported as malicious
+        if decoded_response.get('data') and decoded_response['data']['isPublic']:
+            return True, decoded_response['data']['abuseConfidenceScore']  # Return True and the score
+        return False, 0  # Return False and a score of 0
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error in request for IP {ip}: {e}")
+        print("Warning: API request failed. Proceeding without malicious IP check.")
+        return False, 0  # Return False and a score of 0 in case of an error
+
+def parse_log_line(log_line):
+    """Parse a single line of the log file."""
+    global traffic_stats, HTTP_200_PATHS
+    match = log_pattern.match(log_line)  # Use regex to match the log format
+
+    if match:
+        data = match.groupdict()
+        ip = data['ip']
+        status = int(data['status'])
+        path = data['path']
+        size = int(data['size']) if data['size'].isdigit() else 0
+        user_agent = data['user_agent']
+
+        # Update traffic statistics
+        traffic_stats['total_requests'] += 1
+        traffic_stats['total_bytes'] += size
+        traffic_stats['unique_ips'].add(ip)
+        traffic_stats['user_agent_counts'][user_agent] += 1
+        traffic_stats['ip_counts'][ip] += 1
+
+        # Aggiungere il path al contatore se lo status è 200
+        if status == 200:
+            HTTP_200_PATHS[path] += 1
+
+        # Check if the IP is in the whitelist
+        if ip in IP_WHITELIST:
+            return
+
+        # Check if the path is suspicious
+        if is_suspicious_path(path):
+            anomaly_reason = 'Suspicious Path Detected'
+            traffic_stats['suspicious_requests'].append({
+                'ip': ip,
+                'path': path,
+                'malicious': False,
+                'status': status,
+                'anomalies': [anomaly_reason]
+            })
+            update_anomaly_db(ip, anomaly_reason)
+
+        # Check IP against AbuseIPDB
+        is_abusive, score = check_abuse_ip(ip)
+        if is_abusive and score > 50:  # Report only if score is greater than 50
+            anomaly_reason = f'Malicious IP Detected (Score: {score})'
+            traffic_stats['suspicious_requests'].append({
+                'ip': ip,
+                'path': path,
+                'malicious': True,
+                'status': status,
+                'anomalies': [anomaly_reason]
+            })
+            update_anomaly_db(ip, anomaly_reason)
+
+        # Check if the number of requests from the same IP exceeds the limit
+        if traffic_stats['ip_counts'][ip] > MAX_REQUESTS_PER_MINUTE:
+            anomaly_reason = f'Exceeds max requests: {MAX_REQUESTS_PER_MINUTE}'
+            traffic_stats['suspicious_requests'].append({
+                'ip': ip,
+                'path': path,
+                'malicious': False,
+                'status': status,
+                'anomalies': [anomaly_reason]
+            })
+            update_anomaly_db(ip, anomaly_reason)
+
+geo_db_path = 'GeoLite2-Country.mmdb'  # Assicurati che il file sia disponibile nella directory specificata
+
+def get_country(ip):
+    """Retrieve country information for a given IP using the GeoLite2 database."""
+    try:
+        with geoip2.database.Reader(geo_db_path) as reader:
+            response = reader.country(ip)
+            return response.country.name
+    except Exception as e:
+        print(f"Error retrieving country for IP {ip}: {e}")
+        return "Unknown"
+
+def generate_html_report(report_filename):
+    current_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    total_bytes_mb = traffic_stats['total_bytes'] / (1024 * 1024)
+    avg_requests_per_ip = (traffic_stats['total_requests'] / len(traffic_stats['unique_ips'])) if traffic_stats['unique_ips'] else 0
+    logo_url = "OM_Logo.png" 
+
+    # Start HTML content
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>RequestShield Report</title>
+        <style>
+            body {{
+                font-family: 'Arial', sans-serif;
+                background-color: #121212;
+                color: #EAEAEA;
+            }}
+            .container {{
+                width: 80%;
+                margin: 50px auto;
+            }}
+            h1 {{
+                text-align: center;
+                color: #FF4500;
+            }}
+            h2 {{
+                color: #FF5733;
+                border-bottom: 2px solid #FF5733;
+                padding-bottom: 10px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 20px;
+            }}
+            th, td {{
+                padding: 12px;
+                border: 1px solid #fff;
+            }}
+            th {{
+                background-color: #FF5733;
+                color: #000;
+            }}
+            td {{
+                background-color: #1E1E1E;
+            }}
+            .suspicious {{
+                background-color: #ff3333;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+                         <!-- Logo OSINT Matter -->
+                        <div class="logo-container">
+                            <img src="{logo_url}" alt="OSINT Matter Logo" width="150" height="150">
+                        </div>
+
+            <h1>RequestShield Report</h1>
+            <p><strong>Report generated on:</strong> {current_datetime}</p>
+
+            <!-- Traffic Summary -->
+            <h2>Traffic Summary</h2>
+            <p>
+                Total Requests: {traffic_stats['total_requests']}<br>
+                Total Data (MB): {total_bytes_mb:.2f}<br>
+                Unique IPs: {len(traffic_stats['unique_ips'])}<br>
+                Average Requests per IP: {avg_requests_per_ip:.2f}
+            </p>
+
+            <!-- Suspicious Requests Details -->
+            <h2>Suspicious Requests Summary</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>IP Address</th>
+                        <th>Country</th>
+                        <th>Total Requests</th>
+                        <th>Requested Paths</th>
+                        <th>Anomalies</th>
+                        <th>Status</th>
+                        <th>Risk Score</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+
+    # Aggregating suspicious requests by IP
+    suspicious_ips = {}
+    for req in traffic_stats['suspicious_requests']:
+        ip = req.get('ip', 'N/A')
+        status = req.get('status', 'N/A')
+        anomalies = req.get('anomalies', [])
+        risk_score = req.get('risk_score', 'N/A')
+        path = req.get('path', 'N/A')
+        country = get_country(ip)  # Retrieve country using GeoLite2
+
+        if ip not in suspicious_ips:
+            suspicious_ips[ip] = {
+                'total_requests': 0,
+                'country': country,
+                'anomalies': set(),
+                'status': status,
+                'risk_score': risk_score,
+                'paths': set()
+            }
+        
+        suspicious_ips[ip]['total_requests'] += 1
+        suspicious_ips[ip]['anomalies'].update(anomalies)  
+        suspicious_ips[ip]['paths'].add(path)  # Aggregate unique paths requested by IP
+
+    # Populate the table with suspicious IP details
+    for ip, details in suspicious_ips.items():
+        anomalies = ', '.join(details['anomalies']) if details['anomalies'] else 'None'
+        paths = ', '.join(details['paths']) if details['paths'] else 'None'
+        html_content += f"""
+        <tr class="suspicious">
+            <td>{ip}</td>
+            <td>{details['country']}</td>
+            <td>{details['total_requests']}</td>
+            <td>{paths}</td>
+            <td>{anomalies}</td>
+            <td>{details['status']}</td>
+            <td>{details['risk_score']}</td>
+        </tr>
+        """
+    
+    # Closing HTML tags
+    html_content += """
+                </tbody>
+            </table>
+        </div>
+        <footer>
+            <p>Report created by <a href="https://osintmatter.com" target="_blank">OSINT Matter</a></p>
+        </footer>
+    </body>
+    </html>
+    """
+
+    # Save HTML report
+    with open(report_filename, 'w') as report_file:
+        report_file.write(html_content)
+
+def main():
+    """Main function to orchestrate log analysis."""
+    log_file_path = config['DEFAULT']['log_file']  # Path to your log file
+    html_report_file = 'report.html'  # Output HTML report file
+
+    current_log_hash = compute_file_hash(log_file_path)
+    last_log_hash = load_last_log_hash()
+
+    if current_log_hash == last_log_hash:
+        print("No changes detected in the log file since the last run. Exiting.")
+        return
+
+    save_current_log_hash(current_log_hash)  # Save the new hash
+
+    print("Analyzing log file...")  # Indicate analysis start
+    try:
+        with open(log_file_path) as log_file:
+            for log_line in log_file:
+                parse_log_line(log_line)
+
+        generate_html_report(html_report_file)  # Generate the HTML report
+        print("Log analysis completed successfully. HTML report generated.")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        logging.error(f"An error occurred during log analysis: {e}")
+
+
+if __name__ == '__main__':
+    main()
