@@ -1,4 +1,6 @@
-# RequestShield - Log Analysis for Security
+# RequestShield 
+
+Log Analysis for Security
 
 **RequestShield** is a tool designed to analyze HTTP access logs and identify suspicious IP addresses and potential security threats. It uses factors like geolocation, abuse history, request volume, and suspicious request paths to assign a risk score to each IP, providing actionable insights for security monitoring.
 
