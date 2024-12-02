@@ -2,7 +2,8 @@
 
 Log Analysis for Security
 
-**RequestShield** is a tool designed to analyze HTTP access logs and identify suspicious IP addresses and potential security threats. It uses factors like geolocation, abuse history, request volume, and suspicious request paths to assign a risk score to each IP, providing actionable insights for security monitoring.
+**RequestShield** is a 100% Free and OpenSource tool designed to analyze HTTP access.logs and identify suspicious HTTP requests and potential security threats. It uses factors like geolocation, abuse history, request volume, and suspicious request paths to assign a risk score to each IP, providing actionable insights for security monitoring.
+
 
 ## Purpose
 
@@ -12,7 +13,7 @@ RequestShield helps security teams detect and mitigate threats by analyzing acce
 - **Abuse monitoring** (identifying flagged IPs)
 
 ## Features
-- **Log Parsing:** Analyzes common log format access logs.
+- **Log Parsing:** Analyzes common log format access logs (https://en.wikipedia.org/wiki/Common_Log_Format).
 - **Risk Scoring:** Factors considered include:
   - **Geolocation:** Risky countries (e.g., CN, RU, IN)
   - **Abuse History:** Checks IPs against AbuseIPDB
