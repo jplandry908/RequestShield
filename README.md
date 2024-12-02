@@ -22,7 +22,7 @@ RequestShield helps security teams detect and mitigate threats by analyzing acce
 ## Features
 - **Log Parsing:** Analyzes common log format access logs (https://en.wikipedia.org/wiki/Common_Log_Format).
 - **Risk Scoring:** Factors considered include:
-  - **Geolocation:** Risky countries (e.g., CN, RU, IN)
+  - **Geolocation:** Risky countries 
   - **Abuse History:** Checks IPs against AbuseIPDB
   - **Request Volume:** Flags high request rates
   - **Suspicious Paths:** Detects risky request paths (e.g., `/admin`)
