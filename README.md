@@ -69,15 +69,10 @@ config_file["API"] = {
 config_file["WHITELIST"] = {
     "ips": "changeme"
 }
-
-# RISK SCORING (compile)
-config_file["SCORING"] = {
-    "path_risk_weight": "1.0",
-    "geo_risk_weight": "0.5",
-    "abuse_ip_weight": "0.9",
-    "request_volume_weight": "0.6"
-}
-
+```
+Once properly edited, run:
+```bash
+python3 config.py
 ```
 ## Usage
 
