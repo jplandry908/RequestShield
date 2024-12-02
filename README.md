@@ -93,3 +93,11 @@ Output
 
 - Risk Scoring: Each IP gets a score based on various risk factors.
 - Report: HTML report with a summary of flagged IPs and anomalies.
+
+## Contact Info
+
+For questions or further information, contact us at info@osintmatter.com.
+
+You can also find us on X : [Osint Matter](https://twitter.com/MatterOsint)
+
+Visit our website: [osintmatter.com](https://osintmatter.com)
